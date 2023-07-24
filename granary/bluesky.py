@@ -4,7 +4,6 @@ https://bsky.app/
 https://atproto.com/lexicons/app-bsky-actor
 https://github.com/bluesky-social/atproto/tree/main/lexicons/app/bsky
 """
-import copy
 import json
 import logging
 from pathlib import Path
@@ -461,12 +460,10 @@ def to_as1(obj, type=None):
     raise ValueError('Bluesky object missing $type field')
 
   # TODO: once we're on Python 3.10, switch this to a match statement!
-  if type in ('app.bsky.actor.defs#profileView',
-              'app.bsky.actor.defs#profileViewBasic'):
-    images = [{'url': obj.get('avatar')}]
-    banner = obj.get('banner')
-    if banner:
-      images.append({'url': obj.get('banner'), 'objectType': 'featured'})
+  if type in (
+          'app.bsky.actor.defs#profileView',
+          'app.bsky.actor.defs#profileViewBasic',
+          'app.bsky.actor.defs#profileViewDetailed'):
 
     handle = obj.get('handle')
     did = obj.get('did')
@@ -479,7 +476,7 @@ def to_as1(obj, type=None):
               else None),
       'displayName': obj.get('displayName'),
       'summary': obj.get('description'),
-      'image': images,
+      'image': {'url': obj.get('avatar')},
     }
 
   elif type == 'app.bsky.feed.post':
@@ -596,6 +593,7 @@ def to_as1(obj, type=None):
     reason = obj.get('reason')
     if reason and reason.get('$type') == 'app.bsky.feed.defs#reasonRepost':
       ret = {
+        'id': obj.get('post').get('viewer').get('repost'),
         'objectType': 'activity',
         'verb': 'share',
         'object': ret,
@@ -645,6 +643,10 @@ class Bluesky(Source):
   BASE_URL = 'https://bsky.app'
   NAME = 'Bluesky'
   TRUNCATE_TEXT_LENGTH = 300  # TODO: load from feed.post lexicon
+  URL_CANONICALIZER = util.UrlCanonicalizer(
+          domain=DOMAIN,
+          # Bluesky does not support HEAD requests.
+          redirects=False)
 
   def __init__(self, handle, did=None, access_token=None, app_password=None):
     """Constructor.
@@ -709,9 +711,9 @@ class Bluesky(Source):
     return f'{cls.user_url(handle)}/post/{tid}'
 
   def get_activities_response(self, user_id=None, group_id=None, app_id=None,
-                              activity_id=None, fetch_replies=False,
-                              fetch_likes=False, fetch_shares=False,
-                              include_shares=True, fetch_events=False,
+                              activity_id=None, fetch_replies=True,
+                              fetch_likes=True, fetch_shares=True,
+                              include_shares=False, fetch_events=False,
                               fetch_mentions=False, search_query=None,
                               start_index=None, count=None, cache=None, **kwargs):
     """Fetches posts and converts them to AS1 activities.
@@ -748,14 +750,161 @@ class Bluesky(Source):
       resp = self.client.app.bsky.feed.getAuthorFeed({}, actor=handle, **params)
       posts = resp.get('feed', [])
 
-    # TODO: inReplyTo
-    ret = self.make_activities_base_response(
-      util.trim_nulls(to_as1(post, type='app.bsky.feed.defs#feedViewPost'))
-      for post in posts
-    )
-    ret['actor'] = {
-      'id': self.did,
-      'displayName': self.handle,
-      'url': self.user_url(self.handle),
+    if cache is None:
+      # for convenience, throwaway object just for this method
+      cache = {}
+
+    activities = []
+
+    for post in posts:
+      if not include_shares:
+        reason = post.get('reason')
+        if reason and reason.get('$type') == 'app.bsky.feed.defs#reasonRepost':
+          continue
+
+      activity = self.postprocess_activity(self._post_to_activity(post))
+      activities.append(activity)
+      obj = activity['object']
+      id = obj['id']
+      tags = obj.setdefault('tags', [])
+
+      bs_post = post.get('post')
+      if bs_post:
+        # Likes
+        like_count = bs_post.get('likeCount')
+        if fetch_likes and like_count and like_count != cache.get('ABL ' + id):
+          likers = self.client.app.bsky.feed.getLikes({}, uri=bs_post.get('uri'))
+          tags.extend(self._make_like(bs_post, l.get('actor')) for l in likers.get('likes'))
+          cache['ABL ' + id] = count
+
+        # Reposts
+        repost_count = bs_post.get('repostCount')
+        if fetch_shares and repost_count and repost_count != cache.get('ABRP ' + id):
+          reposters = self.client.app.bsky.feed.getRepostedBy({}, uri=bs_post.get('uri'))
+          tags.extend(self._make_share(bs_post, r) for r in reposters.get('repostedBy'))
+          cache['ABRP ' + id] = count
+
+        # Replies
+        reply_count = bs_post.get('replyCount')
+        if fetch_replies and reply_count and reply_count != cache.get('ABR ' + id):
+          replies = self._get_replies(bs_post.get('uri'))
+          replies = [to_as1(reply, 'app.bsky.feed.defs#threadViewPost') for reply in replies]
+          for r in replies:
+            r['id'] = self.tag_uri(r['id'])
+          obj['replies'] = {
+            'items': replies,
+          }
+          cache['ABR ' + id] = count
+
+    resp = self.make_activities_base_response(util.trim_nulls(activities))
+    return resp
+
+  def user_to_actor(self, user):
+    """Converts a dict user to an actor.
+
+    Args:
+      user: Bluesky user app.bsky.actor.defs#profileViewDetailed
+
+    Returns:
+      an ActivityStreams actor dict, ready to be JSON-encoded
+    """
+    return to_as1(user)
+
+  def get_comment(self, comment_id, **kwargs):
+    """Fetches and returns a comment.
+
+    Args:
+      comment_id: string status id
+      **kwargs: unused
+
+    Returns: dict, ActivityStreams object
+
+    Raises:
+      :class:`ValueError`: if comment_id is invalid
+    """
+    post_thread = self.client.app.bsky.feed.getPostThread({}, uri=comment_id)
+    obj = to_as1(post_thread.get('thread'), 'app.bsky.feed.defs#threadViewPost')
+    return obj
+
+  def _post_to_activity(self, post):
+    """Converts a post to an activity.
+
+    Args:
+      post: Bluesky post app.bluesky.feed.defs#feedViewPost
+
+    Returns: AS1 activity
+    """
+    obj = to_as1(post, type='app.bsky.feed.defs#feedViewPost')
+    return {
+      'verb': 'post',
+      'published': obj.get('published'),
+      'id': obj.get('id'),
+      'url': obj.get('url'),
+      'actor': obj.get('author'),
+      'object': obj,
+      'context': {'inReplyTo': obj.get('inReplyTo')},
     }
+
+  def _make_like(self, post, actor):
+    return self._make_like_or_share(post, actor, 'like')
+
+  def _make_share(self, post, actor):
+    return self._make_like_or_share(post, actor, 'share')
+
+  def _make_like_or_share(self, post, actor, verb):
+    """Generates and returns a ActivityStreams like object.
+
+    Args:
+      post: dict, Bluesky app.bsky.feed.defs#feedViewPost
+      actor: dict, Bluesky app.bsky.actor.defs#profileView
+      verb: string, 'like' or 'share'
+
+    Returns: dict, AS1 like activity
+    """
+    assert verb in ('like', 'share')
+    label = 'favorited' if verb == 'like' else 'reblogged'
+    url = at_uri_to_web_url(post.get('uri'), post.get('author').get('handle'))
+    actor_id = actor.get('did')
+    author = to_as1(actor, 'app.bsky.actor.defs#profileView')
+    author['id'] = self.tag_uri(author['id'])
+    return {
+      'id': self.tag_uri(f"{post.get('uri')}_{label}_by_{actor_id}"),
+      'url': url,
+      'objectType': 'activity',
+      'verb': verb,
+      'object': {'url': url},
+      'author': author,
+    }
+
+  def _get_replies(self, uri):
+    """
+    Gets the replies to a specific post and returns them
+    in ascending order of creation. Does not include the original post.
+
+    Args:
+      uri: string, post uri
+
+    Returns: array, Bluesky app.bsky.feed.defs#threadViewPost
+    """
+    ret = []
+    resp = self.client.app.bsky.feed.getPostThread({}, uri=uri)
+    thread = resp.get('thread')
+    if thread:
+      ret = self._recurse_replies(thread)
+    return sorted(ret, key = lambda thread: thread.get('post').get('record').get('createdAt'))
+
+  def _recurse_replies(self, thread):
+    """
+    Recurses through a Bluesky app.bsky.feed.defs#threadViewPost
+    and returns its replies as an array.
+
+    Args:
+      thread: dict, Bluesky app.bsky.feed.defs#threadViewPost
+
+    Returns: array, Bluesky app.bsky.feed.defs#threadViewPost
+    """
+    ret = []
+    for r in thread.get('replies'):
+        ret += [r]
+        ret += self._recurse_replies(r)
     return ret
