@@ -593,7 +593,7 @@ def to_as1(obj, type=None):
     reason = obj.get('reason')
     if reason and reason.get('$type') == 'app.bsky.feed.defs#reasonRepost':
       ret = {
-        'id': obj.get('post').get('viewer').get('repost'),
+        'id': obj.get('post', {}).get('viewer', {}).get('repost'),
         'objectType': 'activity',
         'verb': 'share',
         'object': ret,
@@ -862,7 +862,7 @@ class Bluesky(Source):
     Returns: dict, AS1 like activity
     """
     assert verb in ('like', 'share')
-    label = 'favorited' if verb == 'like' else 'reblogged'
+    label = 'liked' if verb == 'like' else 'reposted'
     url = at_uri_to_web_url(post.get('uri'), post.get('author').get('handle'))
     actor_id = actor.get('did')
     author = to_as1(actor, 'app.bsky.actor.defs#profileView')
@@ -884,19 +884,20 @@ class Bluesky(Source):
     Args:
       uri: string, post uri
 
-    Returns: array, Bluesky app.bsky.feed.defs#threadViewPost
+    Returns: list, Bluesky app.bsky.feed.defs#threadViewPost
     """
     ret = []
     resp = self.client.app.bsky.feed.getPostThread({}, uri=uri)
     thread = resp.get('thread')
     if thread:
       ret = self._recurse_replies(thread)
-    return sorted(ret, key = lambda thread: thread.get('post').get('record').get('createdAt'))
+    return sorted(ret, key = lambda thread: thread.get('post', {}).get('record', {}).get('createdAt'))
 
+  # TODO this ought to take a depth limit.
   def _recurse_replies(self, thread):
     """
     Recurses through a Bluesky app.bsky.feed.defs#threadViewPost
-    and returns its replies as an array.
+    and returns its replies as a list.
 
     Args:
       thread: dict, Bluesky app.bsky.feed.defs#threadViewPost
