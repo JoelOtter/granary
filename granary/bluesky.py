@@ -711,8 +711,8 @@ class Bluesky(Source):
     return f'{cls.user_url(handle)}/post/{tid}'
 
   def get_activities_response(self, user_id=None, group_id=None, app_id=None,
-                              activity_id=None, fetch_replies=True,
-                              fetch_likes=True, fetch_shares=True,
+                              activity_id=None, fetch_replies=False,
+                              fetch_likes=False, fetch_shares=False,
                               include_shares=False, fetch_events=False,
                               fetch_mentions=False, search_query=None,
                               start_index=None, count=None, cache=None, **kwargs):
