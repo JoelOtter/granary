@@ -902,7 +902,7 @@ class Bluesky(Source):
     Args:
       thread: dict, Bluesky app.bsky.feed.defs#threadViewPost
 
-    Returns: array, Bluesky app.bsky.feed.defs#threadViewPost
+    Returns: list, Bluesky app.bsky.feed.defs#threadViewPost
     """
     ret = []
     for r in thread.get('replies'):
