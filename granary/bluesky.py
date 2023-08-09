@@ -465,6 +465,11 @@ def to_as1(obj, type=None):
           'app.bsky.actor.defs#profileViewBasic',
           'app.bsky.actor.defs#profileViewDetailed'):
 
+    images = [{'url': obj.get('avatar')}]
+    banner = obj.get('banner')
+    if banner:
+      images.append({'url': obj.get('banner'), 'objectType': 'featured'})
+
     handle = obj.get('handle')
     did = obj.get('did')
 
@@ -476,7 +481,7 @@ def to_as1(obj, type=None):
               else None),
       'displayName': obj.get('displayName'),
       'summary': obj.get('description'),
-      'image': {'url': obj.get('avatar')},
+      'image': images,
     }
 
   elif type == 'app.bsky.feed.post':
@@ -713,7 +718,7 @@ class Bluesky(Source):
   def get_activities_response(self, user_id=None, group_id=None, app_id=None,
                               activity_id=None, fetch_replies=False,
                               fetch_likes=False, fetch_shares=False,
-                              include_shares=False, fetch_events=False,
+                              include_shares=True, fetch_events=False,
                               fetch_mentions=False, search_query=None,
                               start_index=None, count=None, cache=None, **kwargs):
     """Fetches posts and converts them to AS1 activities.
@@ -765,11 +770,11 @@ class Bluesky(Source):
       activity = self.postprocess_activity(self._post_to_activity(post))
       activities.append(activity)
       obj = activity['object']
-      id = obj['id']
+      id = obj.get('id')
       tags = obj.setdefault('tags', [])
 
       bs_post = post.get('post')
-      if bs_post:
+      if bs_post and id:
         # Likes
         like_count = bs_post.get('likeCount')
         if fetch_likes and like_count and like_count != cache.get('ABL ' + id):
@@ -835,13 +840,13 @@ class Bluesky(Source):
     Returns: AS1 activity
     """
     obj = to_as1(post, type='app.bsky.feed.defs#feedViewPost')
+    if obj.get('objectType') == 'activity':
+      return obj
     return {
       'verb': 'post',
-      'published': obj.get('published'),
-      'id': obj.get('id'),
-      'url': obj.get('url'),
       'actor': obj.get('author'),
       'object': obj,
+      'objectType': 'activity',
       'context': {'inReplyTo': obj.get('inReplyTo')},
     }
 
